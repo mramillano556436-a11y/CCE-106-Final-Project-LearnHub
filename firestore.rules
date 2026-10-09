@@ -1,0 +1,207 @@
+rules_version = '2';
+
+// LearnHub security rules.
+// Deploy with: firebase deploy --only firestore:rules --project learnhub-8cf88
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userDoc(id) { return /databases/$(database)/documents/users/$(id); }
+    function tutorDoc(id) { return /databases/$(database)/documents/tutor_profiles/$(id); }
+    function orderDoc(id) { return /databases/$(database)/documents/orders/$(id); }
+    function txDoc(id) { return /databases/$(database)/documents/transactions/$(id); }
+
+    // Must match AppConfig.adminEmail. Requires a verified email (Google sign-in).
+    function isAdminEmail() {
+      return signedIn()
+        && request.auth.token.email == 'ramillanomarky@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    function me() { return get(userDoc(uid())).data; }
+    function isActive() {
+      return signedIn() && exists(userDoc(uid())) && me().status == 'active';
+    }
+    function isAdmin() { return isAdminEmail() && isActive() && me().role == 'admin'; }
+
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanged(keys) { return changed().hasOnly(keys); }
+
+    // ------------------------------------------------------------------ users
+
+    match /users/{userId} {
+      allow read: if signedIn() && (userId == uid() || isAdmin());
+
+      allow create: if signedIn() && userId == uid()
+        && request.resource.data.status == 'active'
+        && (request.resource.data.role in ['client', 'tutor']
+            || (request.resource.data.role == 'admin' && isAdminEmail()))
+        && request.resource.data.profileComplete == (request.resource.data.role != 'tutor');
+
+      allow update: if
+        // Own profile fields. Tutors may flip profileComplete to true.
+        (userId == uid() && isActive()
+          && onlyChanged(['name', 'phone', 'photoUrl', 'profileComplete', 'updatedAt'])
+          && (!('profileComplete' in changed())
+              || (me().role == 'tutor' && request.resource.data.profileComplete == true)))
+        // The configured admin email promoting its own account.
+        || (userId == uid() && isAdminEmail()
+          && onlyChanged(['role', 'profileComplete', 'updatedAt'])
+          && request.resource.data.role == 'admin')
+        // Admin suspending / reactivating / removing other accounts.
+        || (isAdmin() && userId != uid()
+          && onlyChanged(['status', 'updatedAt'])
+          && request.resource.data.status in ['active', 'suspended', 'deleted']);
+    }
+
+    // --------------------------------------------------------- tutor_profiles
+
+    function validRating(tutorId) {
+      let orderId = request.resource.data.lastRatedOrderId;
+      let before = get(orderDoc(orderId)).data;
+      let after = getAfter(orderDoc(orderId)).data;
+      return onlyChanged(['ratingSum', 'ratingCount', 'lastRatedOrderId'])
+        && request.resource.data.ratingCount == resource.data.ratingCount + 1
+        && before.clientId == uid()
+        && before.tutorId == tutorId
+        && before.status == 'completed'
+        && before.rating == null
+        && after.rating == request.resource.data.ratingSum - resource.data.ratingSum;
+    }
+
+    match /tutor_profiles/{tutorId} {
+      allow read: if signedIn() && (
+        (resource.data.approved == true && resource.data.profileComplete == true)
+        || tutorId == uid() || isAdmin());
+
+      allow create: if signedIn() && tutorId == uid()
+        && getAfter(userDoc(uid())).data.role == 'tutor'
+        && request.resource.data.approved == false
+        && request.resource.data.rejected == false
+        && request.resource.data.profileComplete == false
+        && request.resource.data.ratingSum == 0
+        && request.resource.data.ratingCount == 0;
+
+      allow update: if
+        // Tutor editing their own listing. Approval and ratings are off limits.
+        (tutorId == uid() && isActive()
+          && !changed().hasAny(['approved', 'ratingSum', 'ratingCount', 'lastRatedOrderId', 'createdAt'])
+          && (!('rejected' in changed()) || request.resource.data.rejected == false)
+          && request.resource.data.rateCents is int
+          && request.resource.data.rateCents > 0
+          && request.resource.data.subjects.size() > 0)
+        // Admin approving or rejecting.
+        || (isAdmin() && onlyChanged(['approved', 'rejected', 'updatedAt']))
+        // Client rating a completed order.
+        || (isActive() && validRating(tutorId));
+    }
+
+    // ----------------------------------------------------------------- orders
+
+    function isParty(order) { return uid() == order.clientId || uid() == order.tutorId; }
+
+    function statusChange(from, to) {
+      return resource.data.status == from
+        && request.resource.data.status == to
+        && onlyChanged(['status', 'updatedAt']);
+    }
+
+    function validNewOrder() {
+      let o = request.resource.data;
+      let tutor = get(tutorDoc(o.tutorId)).data;
+      return o.clientId == uid()
+        && o.tutorId != uid()
+        && o.status == 'pending'
+        && o.rating == null
+        && tutor.approved == true
+        && tutor.profileComplete == true
+        && o.amountCents == tutor.rateCents;
+    }
+
+    match /orders/{orderId} {
+      allow read: if signedIn() && (isParty(resource.data) || isAdmin());
+
+      allow create: if isActive() && me().role == 'client' && validNewOrder();
+
+      allow update: if isActive() && (
+        // Tutor: accept, decline, complete (only after payment).
+        (uid() == resource.data.tutorId
+          && (statusChange('pending', 'confirmed')
+              || statusChange('pending', 'declined')
+              || statusChange('paid', 'completed')))
+        // Client: cancel a pending request.
+        || (uid() == resource.data.clientId && statusChange('pending', 'cancelled'))
+        // Client: pay, only together with a new transaction record.
+        || (uid() == resource.data.clientId && statusChange('confirmed', 'paid')
+            && !exists(txDoc(orderId))
+            && existsAfter(txDoc(orderId)))
+        // Client: rate once after completion.
+        || (uid() == resource.data.clientId
+            && resource.data.status == 'completed'
+            && resource.data.rating == null
+            && onlyChanged(['rating', 'updatedAt'])
+            && request.resource.data.rating is int
+            && request.resource.data.rating >= 1
+            && request.resource.data.rating <= 5)
+        // Either party: chat metadata and their own read marker.
+        || (isParty(resource.data)
+            && onlyChanged(['lastMessage', 'lastMessageSenderId', 'lastMessageAt', 'lastRead'])
+            && (!('lastMessageSenderId' in changed()) || request.resource.data.lastMessageSenderId == uid())
+            && request.resource.data.lastRead.diff(resource.data.lastRead).affectedKeys().hasOnly([uid()]))
+      );
+
+      match /messages/{messageId} {
+        allow read: if signedIn() && (isParty(get(orderDoc(orderId)).data) || isAdmin());
+        allow create: if isActive()
+          && isParty(get(orderDoc(orderId)).data)
+          && request.resource.data.senderId == uid()
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 4000;
+      }
+    }
+
+    // ----------------------------------------------------------- transactions
+
+    // The 5% fee is checked here so a modified app cannot change it:
+    // fee = floor(amount / 20), payout = amount - fee, amount = order price.
+    function validPayment(orderId) {
+      let order = get(orderDoc(orderId)).data;
+      let t = request.resource.data;
+      return order.clientId == uid()
+        && order.status == 'confirmed'
+        && t.orderId == orderId
+        && t.clientId == uid()
+        && t.tutorId == order.tutorId
+        && t.amountCents == order.amountCents
+        && t.platformFeeCents is int
+        && t.platformFeeCents * 20 <= t.amountCents
+        && t.amountCents < (t.platformFeeCents + 1) * 20
+        && t.tutorPayoutCents == t.amountCents - t.platformFeeCents
+        && getAfter(orderDoc(orderId)).data.status == 'paid';
+    }
+
+    match /transactions/{orderId} {
+      allow read: if signedIn()
+        && (resource.data.clientId == uid() || resource.data.tutorId == uid() || isAdmin());
+      allow create: if isActive() && validPayment(orderId);
+    }
+
+    // ---------------------------------------------------------------- reports
+
+    match /reports/{reportId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.reporterId == uid());
+      allow create: if isActive()
+        && request.resource.data.reporterId == uid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 1000;
+      allow update: if isAdmin()
+        && onlyChanged(['status', 'decision', 'notes', 'resolvedAt'])
+        && request.resource.data.status == 'resolved';
+    }
+  }
+}

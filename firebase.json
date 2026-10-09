@@ -1,0 +1,25 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "learnhub-8cf88",
+          "appId": "1:352674451965:android:bff767ff004d7624404994",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "learnhub-8cf88",
+          "configurations": {
+            "android": "1:352674451965:android:bff767ff004d7624404994",
+            "windows": "1:352674451965:web:d3906761e5fc6500404994"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
